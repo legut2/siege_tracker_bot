@@ -298,6 +298,150 @@ async def load_state_from_channel(client: discord.Client, guild: discord.Guild):
     except Exception:
         pass
 
+# --- NEW: Operator picker view (grid with side toggle + pagination) ---
+class OperatorPickerView(discord.ui.View):
+    """
+    Ephemeral picker for /tracker play:
+      - Row 0: [Attackers] [Defenders]  ◀️  ▶️  [Close]
+      - Rows 1-4: Operator buttons in a 5x4 grid (20 per page)
+    Already-played operators are disabled for the chosen player.
+    """
+    def __init__(
+        self,
+        tracker: TrackerState,
+        player_key: Literal["P1", "P2"],
+        side: Literal["A", "D"] = "A",
+        page: int = 0,
+    ):
+        super().__init__(timeout=180)
+        self.tracker = tracker
+        self.player_key = player_key
+        self.side = side  # "A" = Attackers, "D" = Defenders
+        self.page = page
+        self._total_pages = 1
+        self._build()
+
+    # ---- helpers ----
+    def _pool(self) -> List[str]:
+        return ATTACKERS if self.side == "A" else DEFENDERS
+
+    def _side_name(self) -> str:
+        return "Attackers" if self.side == "A" else "Defenders"
+
+    def _build(self):
+        self.clear_items()
+
+        p = self.tracker.player(self.player_key)
+        pool = self._pool()
+
+        PER_PAGE = 20  # 4 rows * 5 buttons
+        self._total_pages = max(1, (len(pool) + PER_PAGE - 1) // PER_PAGE)
+        self.page = max(0, min(self.page, self._total_pages - 1))
+        start = self.page * PER_PAGE
+        page_ops = pool[start:start + PER_PAGE]
+
+        # --- Row 0: side toggle + pagination + close ---
+        btn_att = discord.ui.Button(
+            label="Attackers",
+            style=discord.ButtonStyle.primary if self.side == "A" else discord.ButtonStyle.secondary,
+            row=0,
+        )
+        async def _att_cb(interaction: discord.Interaction):
+            self.side = "A"
+            self.page = 0
+            self._build()
+            await self._edit(interaction)
+        btn_att.callback = _att_cb
+        self.add_item(btn_att)
+
+        btn_def = discord.ui.Button(
+            label="Defenders",
+            style=discord.ButtonStyle.primary if self.side == "D" else discord.ButtonStyle.secondary,
+            row=0,
+        )
+        async def _def_cb(interaction: discord.Interaction):
+            self.side = "D"
+            self.page = 0
+            self._build()
+            await self._edit(interaction)
+        btn_def.callback = _def_cb
+        self.add_item(btn_def)
+
+        prev_btn = discord.ui.Button(emoji="◀️", style=discord.ButtonStyle.secondary, disabled=(self.page == 0), row=0)
+        async def _prev_cb(interaction: discord.Interaction):
+            if self.page > 0:
+                self.page -= 1
+                self._build()
+            await self._edit(interaction)
+        prev_btn.callback = _prev_cb
+        self.add_item(prev_btn)
+
+        next_btn = discord.ui.Button(emoji="▶️", style=discord.ButtonStyle.secondary, disabled=(self.page >= self._total_pages - 1), row=0)
+        async def _next_cb(interaction: discord.Interaction):
+            if self.page < self._total_pages - 1:
+                self.page += 1
+                self._build()
+            await self._edit(interaction)
+        next_btn.callback = _next_cb
+        self.add_item(next_btn)
+
+        close_btn = discord.ui.Button(label="Close", style=discord.ButtonStyle.danger, row=0)
+        async def _close_cb(interaction: discord.Interaction):
+            # Just remove the components from the ephemeral message
+            await interaction.response.edit_message(content="Picker closed.", view=None)
+        close_btn.callback = _close_cb
+        self.add_item(close_btn)
+
+        # --- Rows 1-4: operator buttons in a grid (5 per row) ---
+        def make_cb(op_name: str):
+            async def _cb(interaction: discord.Interaction):
+                guild_id = interaction.guild_id
+                if guild_id is None or guild_id not in TRACKERS:
+                    await interaction.response.send_message("No active tracker here. Use /tracker start first.", ephemeral=True)
+                    return
+                tracker = TRACKERS[guild_id]
+                async with tracker.lock:
+                    player = tracker.player(self.player_key)
+                    if player.add_play(op_name):
+                        await update_tracker_message(interaction.client, tracker)
+                        await save_state_to_channel(interaction.client, tracker)
+                        note = f"Marked **{op_name}** as played for **{player.name}**."
+                    else:
+                        note = f"**{player.name}** already played **{op_name}**."
+
+                # Rebuild to reflect disabled state, then update the ephemeral picker message
+                self._build()
+                await self._edit(interaction, note)
+            return _cb
+
+        for idx, op in enumerate(page_ops):
+            disabled = op in p.played
+            btn = discord.ui.Button(
+                label=op,
+                style=discord.ButtonStyle.blurple,
+                disabled=disabled,
+                row=1 + (idx // 5),  # rows 1-4
+            )
+            btn.callback = make_cb(op)
+            self.add_item(btn)
+
+    async def _edit(self, interaction: discord.Interaction, note: str | None = None):
+        # Header content updates with counts & page index
+        p = self.tracker.player(self.player_key)
+        pool = self._pool()
+        remaining_in_side = len(set(pool) - p.played)
+        header = (
+            f"**{p.name}** — {self._side_name()} • Page {self.page + 1}/{self._total_pages} "
+            f"• Remaining in side: {remaining_in_side}\n"
+            f"Tap an operator to mark it as played. (Played = disabled)"
+        )
+        if note:
+            header = f"{note}\n{header}"
+        try:
+            await interaction.response.edit_message(content=header, view=self)
+        except discord.InteractionResponded:
+            # Fallback if we've already responded somehow
+            await interaction.edit_original_response(content=header, view=self)
 # ------------------------- UI Components ------------------------------------
 class TrackerView(discord.ui.View):
     def __init__(self, tracker: TrackerState):
@@ -487,9 +631,16 @@ async def op_autocomplete(interaction: discord.Interaction, current: str) -> Lis
     return [app_commands.Choice(name=o, value=o) for o in ops_pool[:25]]
 
 @tracker_group.command(name="play", description="Mark an operator as played for a player")
-@app_commands.describe(player="Which player?", operator="Operator name (autocomplete)")
+@app_commands.describe(
+    player="Which player?",
+    operator="Operator name (optional — leave blank to choose from a grid)"
+)
 @app_commands.autocomplete(operator=op_autocomplete)
-async def tracker_play(interaction: discord.Interaction, player: Literal["P1", "P2"], operator: str):
+async def tracker_play(
+    interaction: discord.Interaction,
+    player: Literal["P1", "P2"],
+    operator: str | None = None,
+):
     if interaction.guild_id is None:
         await interaction.response.send_message("Run this in a server channel, not DMs.", ephemeral=True)
         return
@@ -498,8 +649,21 @@ async def tracker_play(interaction: discord.Interaction, player: Literal["P1", "
         return
 
     state = TRACKERS[interaction.guild_id]
+
+    # If no operator was typed, open the picker UI (ephemeral)
+    if not operator:
+        view = OperatorPickerView(state, player_key=player, side="A", page=0)
+        p = state.player(player)
+        await interaction.response.send_message(
+            content=f"**{p.name}** — Attackers • Page 1/… • Remaining in side: {len(set(ATTACKERS) - p.played)}\n"
+                    f"Tap an operator to mark it as played. (Played = disabled)",
+            view=view,
+            ephemeral=True,
+        )
+        return
+
+    # Text path (unchanged behavior)
     async with state.lock:
-        # Validate operator
         if operator not in ALL_OPERATORS:
             await interaction.response.send_message(f"`{operator}` isn't a recognized operator.", ephemeral=True)
             return
@@ -510,6 +674,8 @@ async def tracker_play(interaction: discord.Interaction, player: Literal["P1", "
         await update_tracker_message(interaction.client, state)
         await save_state_to_channel(interaction.client, state)
         await interaction.response.send_message(f"Marked **{operator}** as played for **{p.name}**.", ephemeral=True)
+
+
 
 # Optional: show current status again
 @tracker_group.command(name="show", description="Repost/update the tracker message if it went missing")
