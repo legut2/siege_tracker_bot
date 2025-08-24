@@ -700,10 +700,10 @@ async def on_ready():
 # Register the group
 bot.tree.add_command(tracker_group)
 
+
 # ------------------------- Run ----------------------------------------------
 if __name__ == "__main__":
     token = os.getenv("DISCORD_TOKEN")
     if not token:
         raise SystemExit("Please set DISCORD_TOKEN environment variable.")
     bot.run(token)
-
