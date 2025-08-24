@@ -15,16 +15,23 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # Install flyctl
+      # Install flyctl (official way)
       - name: Setup flyctl
-        uses: superfly/flyctl-actions/setup-flyctl@v2  # official action
-        # docs: https://github.com/superfly/flyctl-actions
+        uses: superfly/flyctl-actions/setup-flyctl@master
+        # Optional: pin the CLI version to avoid surprises:
+        # with:
+        #   version: 0.0.462
+
+      # Ensure your app secret exists (safe to re-run). Remove if you manage secrets separately.
+      - name: Set DISCORD_TOKEN secret on Fly
+        env:
+          FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}
+        run: |
+          flyctl secrets set DISCORD_TOKEN="${{ secrets.DISCORD_TOKEN }}" --app siege-tracker-bot --stage
+
+      # Deploy your app using the Dockerfile + fly.toml in the repo
       - name: Deploy
         env:
           FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}
-          FLY_APP_NAME: siege-tracker-bot
         run: |
-          # Ensure secrets exist on the app (safe to re-run)
-          flyctl secrets set DISCORD_TOKEN=${{ secrets.DISCORD_TOKEN }} --app $FLY_APP_NAME --stage
-          # Deploy Dockerfile-based app from the repo
-          flyctl deploy --remote-only --app $FLY_APP_NAME
+          flyctl deploy --remote-only --app siege-tracker-bot
