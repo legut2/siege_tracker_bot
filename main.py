@@ -630,6 +630,20 @@ async def op_autocomplete(interaction: discord.Interaction, current: str) -> Lis
     # Return up to 25 choices as required by Discord
     return [app_commands.Choice(name=o, value=o) for o in ops_pool[:25]]
 
+# --- NEW: catch & surface errors from any slash command ---
+@bot.tree.error
+async def on_app_command_error(interaction: discord.Interaction, error: app_commands.AppCommandError):
+    try:
+        import traceback
+        tb = "".join(traceback.format_exception(type(error), error, error.__traceback__))
+        print("[/commands] ERROR:\n", tb)  # log to console
+        msg = f"⚠️ Something went wrong running that command: `{type(error).__name__}`.\n"
+        if isinstance(error, app_commands.CheckFailure):
+            msg += "I may be missing a permission here."
+        await safe_reply(interaction, content=msg, ephemeral=True)
+    except Exception:
+        pass
+
 @tracker_group.command(name="play", description="Mark an operator as played for a player")
 @app_commands.describe(
     player="Which player?",
