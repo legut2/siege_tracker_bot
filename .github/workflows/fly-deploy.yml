@@ -1,0 +1,30 @@
+name: Deploy to Fly.io
+
+on:
+  push:
+    branches: [ "main" ]
+  workflow_dispatch:
+
+concurrency:
+  group: fly-deploy
+  cancel-in-progress: true
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # Install flyctl
+      - name: Setup flyctl
+        uses: superfly/flyctl-actions/setup-flyctl@v2  # official action
+        # docs: https://github.com/superfly/flyctl-actions
+      - name: Deploy
+        env:
+          FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}
+          FLY_APP_NAME: siege-tracker-bot
+        run: |
+          # Ensure secrets exist on the app (safe to re-run)
+          flyctl secrets set DISCORD_TOKEN=${{ secrets.DISCORD_TOKEN }} --app $FLY_APP_NAME --stage
+          # Deploy Dockerfile-based app from the repo
+          flyctl deploy --remote-only --app $FLY_APP_NAME

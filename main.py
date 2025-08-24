@@ -337,7 +337,7 @@ async def update_tracker_message(client: discord.Client, tracker: TrackerState):
     except discord.NotFound:
         return
 
-    embed = discord.Embed(title="🎯 2-Player Siege Tracker", color=discord.Color.blurple())
+    embed = discord.Embed(title="✨ 2-Player Siege Tracker", color=discord.Color.blurple())
     embed.description = (
         "Use **/tracker play** to mark an operator as played.\n"
         "Use the **View Remaining** buttons or `/tracker remaining` to see operators left.\n"

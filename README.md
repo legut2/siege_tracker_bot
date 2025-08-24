@@ -14,8 +14,7 @@ Usage
 /tracker play player:<P1 or P2> operator:<name> → marks that operator as played (autocomplete shows remaining).
 `
 
-Buttons on the message:
-
-P1 +1 / −1, P2 +1 / −1
-
-P1 Penalty −10, P2 Penalty −10 (auto-enable when that player has played all 76 operators)
+Server Setup
+$env:PATH = "$env:USERPROFILE\.fly\bin;$env:PATH"
+flyctl --version
+flyctl auth login

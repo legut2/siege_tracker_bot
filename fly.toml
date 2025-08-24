@@ -1,0 +1,19 @@
+# fly.toml app configuration file generated for siege-tracker-bot on 2025-08-23T21:28:31-05:00
+#
+# See https://fly.io/docs/reference/configuration/ for information about how to use this file.
+#
+
+app = 'siege-tracker-bot'
+primary_region = 'ord'
+
+[build]
+  dockerfile = 'Dockerfile'
+
+[env]
+  PYTHONUNBUFFERED = '1'
+
+[processes]
+  bot = 'python main.py'
+
+[[vm]]
+  size = 'shared-cpu-1x'
