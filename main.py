@@ -540,3 +540,4 @@ if __name__ == "__main__":
     if not token:
         raise SystemExit("Please set DISCORD_TOKEN environment variable.")
     bot.run(token)
+
