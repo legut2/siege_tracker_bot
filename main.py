@@ -1,24 +1,50 @@
-# Rainbow Six Siege – 2-Player Operator/Kill Tracker for Discord
+# Rainbow Six Siege – 2‑Player Operator/Kill Tracker for Discord
 # --------------------------------------------------------------
-# Additions in this version:
-# - "View Remaining" buttons for each player (ephemeral embed with remaining Attackers/Defenders)
-# - New /tracker remaining command to list remaining ops for a player
-# - /tracker play now accepts player names as well as P1/P2 (with autocomplete)
-# - Main tracker embed shows per-player usage with the actual names you provided
+# Features
+# - Tracks kills for two players with +1 / -1 buttons
+# - Tracks which operators each player has already played (Attackers & Defenders)
+# - Slash command with autocomplete to mark an operator as "played"
+# - "Penalty -10" button for each player that becomes enabled once that player has
+#   used every operator (or anytime if you prefer — toggle via ALLOW_PENALTY_ANYTIME)
+# - Single-file script. Requires: `pip install -U discord.py python-dotenv`
+#
+# Quick start
+# 1) Create a Discord application & bot (https://discord.com/developers/applications)
+# 2) Give the bot the following scopes when generating the invite URL:
+#    - scopes: `bot applications.commands`
+#    - bot permissions: Send Messages, Embed Links, Use Slash Commands
+# 3) Set your token in the DISCORD_TOKEN environment variable
+#    (or replace `os.getenv("DISCORD_TOKEN")` below with your token string for testing)
+# 4) Run: `python discord_siege_tracker.py`
+# 5) In your server, use: `/tracker start player1:<name> player2:<name>`
+#    Then record plays: `/tracker play player:<P1 or P2> operator:<name>`
+#
+# Notes
+# - State is kept in memory per guild. If the bot restarts, the active tracker view will reset.
+# - Operator autocomplete suggests remaining operators matching your input.
+# - The "Penalty -10" buttons enable automatically when a player has no operators left.
+#   If you want the penalty button always enabled, set ALLOW_PENALTY_ANYTIME = True.
 
 from __future__ import annotations
 
 import os
 import asyncio
 from dataclasses import dataclass, field
-from typing import Dict, List, Set, Literal, Optional
+from typing import Dict, List, Set, Literal
 
 import discord
 from discord import app_commands
 from dotenv import load_dotenv
+import io, json, time
 
 # Load environment variables from a .env file, if present
 load_dotenv()
+
+# ---- Channel persistence config ----
+STATE_CHANNEL_NAME = os.getenv("STATE_CHANNEL_NAME", "game-state")  # the channel name to store snapshots
+STATE_SNAPSHOT_LIMIT = int(os.getenv("STATE_SNAPSHOT_LIMIT", "5"))    # keep last N snapshots per guild
+SAVE_MIN_INTERVAL = float(os.getenv("SAVE_MIN_INTERVAL", "10.0"))     # debounce saves (seconds)
+_LAST_SAVE: Dict[int, float] = {}
 
 # ------------------------- Configuration ------------------------------------
 ALLOW_PENALTY_ANYTIME = True  # Set True to always enable the -10 buttons
@@ -26,17 +52,85 @@ INTENTS = discord.Intents.default()  # No privileged intents required
 
 # ------------------------- Operators (from user list) ------------------------
 ATTACKERS: List[str] = [
-    "Rauora", "Striker*", "Deimos", "Ram", "Brava", "Grim", "Sens", "Osa", "Flores", "Zero",
-    "Ace", "Iana", "Kali", "Amaru", "NØKK", "Gridlock", "Nomad", "Maverick", "Lion", "Finka",
-    "Dokkaebi", "Zofia", "Ying", "Jackal", "Hibana", "CAPITÃO", "Blackbeard", "Buck", "Sledge",
-    "Thatcher", "Ash", "Thermite", "Montagne", "Twitch", "Blitz", "IQ", "Fuze", "Glaz",
+    "Rauora",
+    "Striker*",
+    "Deimos",
+    "Ram",
+    "Brava",
+    "Grim",
+    "Sens",
+    "Osa",
+    "Flores",
+    "Zero",
+    "Ace",
+    "Iana",
+    "Kali",
+    "Amaru",
+    "NØKK",
+    "Gridlock",
+    "Nomad",
+    "Maverick",
+    "Lion",
+    "Finka",
+    "Dokkaebi",
+    "Zofia",
+    "Ying",
+    "Jackal",
+    "Hibana",
+    "CAPITÃO",
+    "Blackbeard",
+    "Buck",
+    "Sledge",
+    "Thatcher",
+    "Ash",
+    "Thermite",
+    "Montagne",
+    "Twitch",
+    "Blitz",
+    "IQ",
+    "Fuze",
+    "Glaz",
 ]
 
 DEFENDERS: List[str] = [
-    "Denari", "Skopós", "Sentry*", "Tubarão", "Fenrir", "Solis", "Azami", "Thorn", "Thunderbird",
-    "Aruni", "Melusi", "Oryx", "Wamai", "Goyo", "Warden", "Mozzie", "Kaid", "Clash", "Maestro",
-    "Alibi", "Vigil", "Ela", "Lesion", "Mira", "Echo", "Caveira", "Valkyrie", "Frost", "Mute",
-    "Smoke", "Castle", "Pulse", "Doc", "Rook", "Jäger", "Bandit", "Tachanka", "Kapkan",
+    "Denari",
+    "Skopós",
+    "Sentry*",
+    "Tubarão",
+    "Fenrir",
+    "Solis",
+    "Azami",
+    "Thorn",
+    "Thunderbird",
+    "Aruni",
+    "Melusi",
+    "Oryx",
+    "Wamai",
+    "Goyo",
+    "Warden",
+    "Mozzie",
+    "Kaid",
+    "Clash",
+    "Maestro",
+    "Alibi",
+    "Vigil",
+    "Ela",
+    "Lesion",
+    "Mira",
+    "Echo",
+    "Caveira",
+    "Valkyrie",
+    "Frost",
+    "Mute",
+    "Smoke",
+    "Castle",
+    "Pulse",
+    "Doc",
+    "Rook",
+    "Jäger",
+    "Bandit",
+    "Tachanka",
+    "Kapkan",
 ]
 
 ALL_OPERATORS: List[str] = ATTACKERS + DEFENDERS
@@ -83,123 +177,126 @@ class TrackerState:
 # guild_id -> TrackerState
 TRACKERS: Dict[int, TrackerState] = {}
 
-# ------------------------- Helpers ------------------------------------------
-def _norm(s: str) -> str:
-    return (s or "").strip().lower()
+# ------------------------- Discord Channel Persistence ------------------------------------
 
-def resolve_player_key(arg: str, state: TrackerState) -> Optional[Literal["P1", "P2"]]:
-    """Accepts 'P1'/'P2' or the actual player names (case-insensitive)."""
-    v = _norm(arg)
-    if v in {"p1", "1", "player1"}:
-        return "P1"
-    if v in {"p2", "2", "player2"}:
-        return "P2"
-    if v == _norm(state.player1.name):
-        return "P1"
-    if v == _norm(state.player2.name):
-        return "P2"
-    return None
+# Reuse the same serialize/deserialize helpers
 
-def split_list(items: List[str], max_chars: int = 900) -> List[str]:
-    """Split a list of items into comma-joined chunks that fit in embed fields."""
-    chunks: List[str] = []
-    cur: List[str] = []
-    cur_len = 0
-    for itm in items:
-        add = (2 if cur else 0) + len(itm)  # account for ", "
-        if cur_len + add > max_chars:
-            chunks.append(", ".join(cur))
-            cur = [itm]
-            cur_len = len(itm)
-        else:
-            cur.append(itm)
-            cur_len += add
-    if cur:
-        chunks.append(", ".join(cur))
-    if not chunks:
-        chunks = ["—"]
-    return chunks
+def serialize_state(state: TrackerState) -> dict:
+    return {
+        "version": 1,
+        "guild_id": state.guild_id,
+        "tracker": {
+            "message_id": state.message_id,
+            "channel_id": state.channel_id,
+            "player1": {
+                "name": state.player1.name,
+                "kills": state.player1.kills,
+                "played": sorted(list(state.player1.played)),
+                "history": state.player1.history,
+            },
+            "player2": {
+                "name": state.player2.name,
+                "kills": state.player2.kills,
+                "played": sorted(list(state.player2.played)),
+                "history": state.player2.history,
+            },
+        },
+    }
 
-def make_remaining_embed(state: TrackerState, which: Literal["P1", "P2"]) -> discord.Embed:
-    p = state.player(which)
-    rem = p.remaining_ops()
-    rem_att = sorted(list(rem & ATT_SET))
-    rem_def = sorted(list(rem & DEF_SET))
-
-    embed = discord.Embed(
-        title=f"Remaining Operators – {p.name}",
-        color=discord.Color.green()
+def deserialize_state(data: dict) -> TrackerState:
+    p1 = data["tracker"]["player1"]
+    p2 = data["tracker"]["player2"]
+    return TrackerState(
+        guild_id=int(data["guild_id"]),
+        owner_id=0,
+        player1=PlayerState(
+            name=p1["name"],
+            kills=int(p1["kills"]),
+            played=set(p1.get("played", [])),
+            history=list(p1.get("history", [])),
+        ),
+        player2=PlayerState(
+            name=p2["name"],
+            kills=int(p2["kills"]),
+            played=set(p2.get("played", [])),
+            history=list(p2.get("history", [])),
+        ),
+        message_id=data["tracker"].get("message_id"),
+        channel_id=data["tracker"].get("channel_id"),
     )
-    embed.set_footer(text="Only you can see this (ephemeral)")
-    # Attackers
-    att_chunks = split_list(rem_att)
-    for i, chunk in enumerate(att_chunks, start=1):
-        embed.add_field(name=f"Attackers ({len(rem_att)})" + (f" – {i}" if len(att_chunks) > 1 else ""), value=chunk or "—", inline=False)
-    # Defenders
-    def_chunks = split_list(rem_def)
-    for i, chunk in enumerate(def_chunks, start=1):
-        embed.add_field(name=f"Defenders ({len(rem_def)})" + (f" – {i}" if len(def_chunks) > 1 else ""), value=chunk or "—", inline=False)
-    return embed
 
-def make_full_snapshot_embeds(state: TrackerState) -> List[discord.Embed]:
-    """Build a full, public snapshot: stats + played & remaining lists for both players."""
-    # Main summary
-    e_main = discord.Embed(
-        title="✨ 2-Player Siege Tracker — Full Snapshot",
-        color=discord.Color.blurple()
-    )
-    e_main.description = (
-        "Totals and recent history per player. Full played/remaining lists are below.\n"
-        "Tip: Use `/tracker remaining` for an ephemeral, per-player view."
-    )
-    e_main.add_field(name=f"Player 1 – {state.player1.name}", value=format_player_block(state.player1), inline=False)
-    e_main.add_field(name=f"Player 2 – {state.player2.name}", value=format_player_block(state.player2), inline=False)
+async def get_state_channel(guild: discord.Guild) -> discord.TextChannel | None:
+    if guild is None:
+        return None
+    # Try to find existing channel by name
+    for ch in guild.text_channels:
+        if ch.name == STATE_CHANNEL_NAME:
+            return ch
+    # Try to create if we have permission
+    try:
+        ch = await guild.create_text_channel(STATE_CHANNEL_NAME, reason="Siege tracker: create state channel")
+        return ch
+    except Exception:
+        return None
 
-    def detail(p: PlayerState) -> discord.Embed:
-        rem = p.remaining_ops()
-        rem_att = sorted(list(rem & ATT_SET))
-        rem_def = sorted(list(rem & DEF_SET))
-        played_att = sorted(list(p.played & ATT_SET))
-        played_def = sorted(list(p.played & DEF_SET))
+async def save_state_to_channel(client: discord.Client, state: TrackerState, force: bool = False):
+    now = time.monotonic()
+    last = _LAST_SAVE.get(state.guild_id, 0.0)
+    if not force and (now - last) < SAVE_MIN_INTERVAL:
+        return
+    _LAST_SAVE[state.guild_id] = now
 
-        e = discord.Embed(title=f"Details — {p.name}", color=discord.Color.green())
+    guild = client.get_guild(state.guild_id)
+    if guild is None:
+        return
+    ch = await get_state_channel(guild)
+    if ch is None:
+        return
 
-        # Played lists
-        played_att_chunks = split_list(played_att)
-        for i, chunk in enumerate(played_att_chunks, start=1):
-            e.add_field(
-                name=f"Played Attackers ({len(played_att)})" + (f" – {i}" if len(played_att_chunks) > 1 else ""),
-                value=chunk or "—",
-                inline=False
-            )
-        played_def_chunks = split_list(played_def)
-        for i, chunk in enumerate(played_def_chunks, start=1):
-            e.add_field(
-                name=f"Played Defenders ({len(played_def)})" + (f" – {i}" if len(played_def_chunks) > 1 else ""),
-                value=chunk or "—",
-                inline=False
-            )
+    payload = json.dumps(serialize_state(state), ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+    filename = f"state-{state.guild_id}-{int(time.time())}.json"
+    try:
+        await ch.send(content="【siege-tracker snapshot】", file=discord.File(io.BytesIO(payload), filename=filename))
+    except Exception:
+        return
 
-        # Remaining lists
-        rem_att_chunks = split_list(rem_att)
-        for i, chunk in enumerate(rem_att_chunks, start=1):
-            e.add_field(
-                name=f"Remaining Attackers ({len(rem_att)})" + (f" – {i}" if len(rem_att_chunks) > 1 else ""),
-                value=chunk or "—",
-                inline=False
-            )
-        rem_def_chunks = split_list(rem_def)
-        for i, chunk in enumerate(rem_def_chunks, start=1):
-            e.add_field(
-                name=f"Remaining Defenders ({len(rem_def)})" + (f" – {i}" if len(rem_def_chunks) > 1 else ""),
-                value=chunk or "—",
-                inline=False
-            )
-        return e
+    # Optional cleanup: keep only the most recent N snapshots from this bot
+    try:
+        snapshots = []
+        async for msg in ch.history(limit=50):
+            if msg.author.id == client.user.id and msg.attachments and "siege-tracker snapshot" in (msg.content or ""):
+                snapshots.append(msg)
+        # Keep newest STATE_SNAPSHOT_LIMIT
+        snapshots.sort(key=lambda m: m.created_at, reverse=True)
+        for msg in snapshots[STATE_SNAPSHOT_LIMIT:]:
+            try:
+                await msg.delete()
+            except Exception:
+                pass
+    except Exception:
+        pass
 
-    # Return 3 embeds total (well within Discord’s 10-embed limit)
-    return [e_main, detail(state.player1), detail(state.player2)]
-
+async def load_state_from_channel(client: discord.Client, guild: discord.Guild):
+    ch = await get_state_channel(guild)
+    if ch is None:
+        return
+    try:
+        async for msg in ch.history(limit=50):
+            if msg.author.id != client.user.id or not msg.attachments:
+                continue
+            for att in msg.attachments:
+                if att.filename.endswith(".json"):
+                    raw = await att.read()
+                    data = json.loads(raw.decode("utf-8"))
+                    restored = deserialize_state(data)
+                    TRACKERS[guild.id] = restored
+                    try:
+                        await update_tracker_message(client, restored)
+                    except Exception:
+                        pass
+                    return
+    except Exception:
+        pass
 
 # ------------------------- UI Components ------------------------------------
 class TrackerView(discord.ui.View):
@@ -233,16 +330,6 @@ class TrackerView(discord.ui.View):
     async def penalty_p1(self, interaction: discord.Interaction, button: discord.ui.Button):
         await self._adjust_kills(interaction, "P1", -10)
 
-    @discord.ui.button(label="P1 View Remaining", style=discord.ButtonStyle.primary, custom_id="p1_remaining")
-    async def p1_remaining(self, interaction: discord.Interaction, button: discord.ui.Button):
-        guild_id = interaction.guild_id
-        if guild_id is None or guild_id not in TRACKERS:
-            await interaction.response.send_message("No active tracker here. Use /tracker start first.", ephemeral=True)
-            return
-        tracker = TRACKERS[guild_id]
-        embed = make_remaining_embed(tracker, "P1")
-        await interaction.response.send_message(embed=embed, ephemeral=True)
-
     # ------ P2 Buttons ------
     @discord.ui.button(label="P2 +1 Kill", style=discord.ButtonStyle.success, custom_id="p2_plus")
     async def p2_plus(self, interaction: discord.Interaction, button: discord.ui.Button):
@@ -255,16 +342,6 @@ class TrackerView(discord.ui.View):
     @discord.ui.button(label="P2 Penalty -10", style=discord.ButtonStyle.danger, custom_id="penalty_p2")
     async def penalty_p2(self, interaction: discord.Interaction, button: discord.ui.Button):
         await self._adjust_kills(interaction, "P2", -10)
-
-    @discord.ui.button(label="P2 View Remaining", style=discord.ButtonStyle.primary, custom_id="p2_remaining")
-    async def p2_remaining(self, interaction: discord.Interaction, button: discord.ui.Button):
-        guild_id = interaction.guild_id
-        if guild_id is None or guild_id not in TRACKERS:
-            await interaction.response.send_message("No active tracker here. Use /tracker start first.", ephemeral=True)
-            return
-        tracker = TRACKERS[guild_id]
-        embed = make_remaining_embed(tracker, "P2")
-        await interaction.response.send_message(embed=embed, ephemeral=True)
 
     # ------ Shared ------
     async def _adjust_kills(self, interaction: discord.Interaction, which: Literal["P1", "P2"], delta: int):
@@ -279,6 +356,7 @@ class TrackerView(discord.ui.View):
             # Update penalty button states in case something changed
             self.update_penalty_buttons()
             await update_tracker_message(interaction.client, tracker)
+            await save_state_to_channel(interaction.client, tracker)
             try:
                 await interaction.response.defer()  # Acknowledge without extra message
             except discord.InteractionResponded:
@@ -297,6 +375,7 @@ class SiegeTracker(discord.Client):
 bot = SiegeTracker()
 
 # ---- Helpers to render/update the main message ----
+
 def format_player_block(p: PlayerState) -> str:
     rem_att, rem_def = p.remaining_counts()
     played_att = len(p.played & ATT_SET)
@@ -317,13 +396,12 @@ def format_player_block(p: PlayerState) -> str:
     last_def = last_from_history(DEF_SET)
 
     return (
-        f"**Kills:** {p.kills}\n"
-        f"**Totals:** Played {len(p.played)} / {ALL_COUNT} • Remaining {ALL_COUNT - len(p.played)}\n"
-        f"**Attackers:** {played_att}/{len(ATTACKERS)} played • {rem_att} remaining\n"
-        f"Last A: {last_att}\n"
-        f"**Defenders:** {played_def}/{len(DEFENDERS)} played • {rem_def} remaining\n"
-        f"Last D: {last_def}\n"
-        f"**Commands:** `/tracker play player:{p.name} operator:<name>` • `/tracker remaining player:{p.name}`"
+        f"**Kills:** {p.kills}"
+        f"**Totals:** Played {len(p.played)} / {ALL_COUNT} • Remaining {ALL_COUNT - len(p.played)}"
+        f"**Attackers:** {played_att}/{len(ATTACKERS)} played • {rem_att} remaining"
+        f"Last A: {last_att}"
+        f"**Defenders:** {played_def}/{len(DEFENDERS)} played • {rem_def} remaining"
+        f"Last D: {last_def}"
     )
 
 async def update_tracker_message(client: discord.Client, tracker: TrackerState):
@@ -337,10 +415,9 @@ async def update_tracker_message(client: discord.Client, tracker: TrackerState):
     except discord.NotFound:
         return
 
-    embed = discord.Embed(title="✨ 2-Player Siege Tracker", color=discord.Color.blurple())
+    embed = discord.Embed(title="🎯 2‑Player Siege Tracker", color=discord.Color.blurple())
     embed.description = (
-        "Use **/tracker play** to mark an operator as played.\n"
-        "Use the **View Remaining** buttons or `/tracker remaining` to see operators left.\n"
+        "Use **/tracker play** to mark an operator as played."
         "Buttons adjust kills. Penalty buttons are always available (−10). Attackers/Defenders tracked separately."
     )
     embed.add_field(name=f"Player 1 – {tracker.player1.name}", value=format_player_block(tracker.player1), inline=False)
@@ -350,9 +427,9 @@ async def update_tracker_message(client: discord.Client, tracker: TrackerState):
     await msg.edit(embed=embed, view=view)
 
 # ---- /tracker command group ----
-tracker_group = app_commands.Group(name="tracker", description="2-Player R6S tracker")
+tracker_group = app_commands.Group(name="tracker", description="2‑Player R6S tracker")
 
-@tracker_group.command(name="start", description="Start a new 2-player tracker in this channel")
+@tracker_group.command(name="start", description="Start a new 2‑player tracker in this channel")
 @app_commands.describe(player1="Display name for Player 1", player2="Display name for Player 2")
 async def tracker_start(interaction: discord.Interaction, player1: str, player2: str):
     if interaction.guild_id is None:
@@ -368,10 +445,9 @@ async def tracker_start(interaction: discord.Interaction, player1: str, player2:
     TRACKERS[interaction.guild_id] = state
 
     # Send initial message with view
-    embed = discord.Embed(title="✨ 2-Player Siege Tracker", color=discord.Color.blurple())
+    embed = discord.Embed(title="🎯 2‑Player Siege Tracker", color=discord.Color.blurple())
     embed.description = (
-        "Use **/tracker play** to mark an operator as played.\n"
-        "Use the **View Remaining** buttons or `/tracker remaining` to see operators left.\n"
+        "Use **/tracker play** to mark an operator as played."
         "Buttons adjust kills. Penalty buttons are always available (−10). Attackers/Defenders tracked separately."
     )
     embed.add_field(name=f"Player 1 – {state.player1.name}", value=format_player_block(state.player1), inline=False)
@@ -383,18 +459,8 @@ async def tracker_start(interaction: discord.Interaction, player1: str, player2:
     state.message_id = msg.id
     state.channel_id = msg.channel.id
 
-# ---------- Autocomplete helpers ----------
-async def player_autocomplete(interaction: discord.Interaction, current: str) -> List[app_commands.Choice[str]]:
-    guild_id = interaction.guild_id
-    options: List[str] = []
-    if guild_id and guild_id in TRACKERS:
-        st = TRACKERS[guild_id]
-        options = [st.player1.name, st.player2.name, "P1", "P2"]
-    else:
-        options = ["P1", "P2"]
-    cur = (current or "").lower()
-    filtered = [o for o in options if cur in o.lower()]
-    return [app_commands.Choice(name=o, value=o) for o in filtered[:25]]
+    # Persist initial state
+    await save_state_to_channel(interaction.client, state, force=True)
 
 # Autocomplete for operator names (filters to remaining operators for selected player)
 async def op_autocomplete(interaction: discord.Interaction, current: str) -> List[app_commands.Choice[str]]:
@@ -406,13 +472,12 @@ async def op_autocomplete(interaction: discord.Interaction, current: str) -> Lis
 
     if guild_id and guild_id in TRACKERS:
         state = TRACKERS[guild_id]
-        # Determine which player is selected in the same command
+        # Which player was chosen in the same command?
         try:
-            which_raw: str = str(interaction.namespace.player)  # can be 'P1','P2', or a name
+            which: str = str(interaction.namespace.player)  # "P1" or "P2"
         except Exception:
-            which_raw = "P1"
-        which = resolve_player_key(which_raw, state) or "P1"
-        p = state.player(which)
+            which = "P1"
+        p = state.player(which) if which in ("P1", "P2") else state.player1
         ops_pool = sorted(list(p.remaining_ops()))
 
     if query:
@@ -421,11 +486,10 @@ async def op_autocomplete(interaction: discord.Interaction, current: str) -> Lis
     # Return up to 25 choices as required by Discord
     return [app_commands.Choice(name=o, value=o) for o in ops_pool[:25]]
 
-# ---------- Commands ----------
 @tracker_group.command(name="play", description="Mark an operator as played for a player")
-@app_commands.describe(player="Who played? (P1/P2 or the player's name)", operator="Operator name")
-@app_commands.autocomplete(player=player_autocomplete, operator=op_autocomplete)
-async def tracker_play(interaction: discord.Interaction, player: str, operator: str):
+@app_commands.describe(player="Which player?", operator="Operator name (autocomplete)")
+@app_commands.autocomplete(operator=op_autocomplete)
+async def tracker_play(interaction: discord.Interaction, player: Literal["P1", "P2"], operator: str):
     if interaction.guild_id is None:
         await interaction.response.send_message("Run this in a server channel, not DMs.", ephemeral=True)
         return
@@ -434,57 +498,38 @@ async def tracker_play(interaction: discord.Interaction, player: str, operator: 
         return
 
     state = TRACKERS[interaction.guild_id]
-    which = resolve_player_key(player, state)
-    if which is None:
-        await interaction.response.send_message("I couldn't match that player. Use P1/P2 or the exact name shown in the tracker.", ephemeral=True)
-        return
-
     async with state.lock:
         # Validate operator
         if operator not in ALL_OPERATORS:
             await interaction.response.send_message(f"`{operator}` isn't a recognized operator.", ephemeral=True)
             return
-        p = state.player(which)
+        p = state.player(player)
         if not p.add_play(operator):
             await interaction.response.send_message(f"{p.name} already played **{operator}**.", ephemeral=True)
             return
         await update_tracker_message(interaction.client, state)
+        await save_state_to_channel(interaction.client, state)
         await interaction.response.send_message(f"Marked **{operator}** as played for **{p.name}**.", ephemeral=True)
 
-@tracker_group.command(name="remaining", description="Show remaining operators for a player")
-@app_commands.describe(player="Which player? (P1/P2 or player's name)")
-@app_commands.autocomplete(player=player_autocomplete)
-async def tracker_remaining(interaction: discord.Interaction, player: str):
-    if interaction.guild_id is None:
-        await interaction.response.send_message("Run this in a server channel, not DMs.", ephemeral=True)
-        return
-    if interaction.guild_id not in TRACKERS:
-        await interaction.response.send_message("No active tracker here. Use /tracker start first.", ephemeral=True)
-        return
-
-    state = TRACKERS[interaction.guild_id]
-    which = resolve_player_key(player, state)
-    if which is None:
-        await interaction.response.send_message("I couldn't match that player. Use P1/P2 or the exact name shown in the tracker.", ephemeral=True)
-        return
-
-    embed = make_remaining_embed(state, which)
-    await interaction.response.send_message(embed=embed, ephemeral=True)
-
-@tracker_group.command(name="show", description="Repost/update the tracker message and post a full snapshot")
+# Optional: show current status again
+@tracker_group.command(name="show", description="Repost/update the tracker message if it went missing")
 async def tracker_show(interaction: discord.Interaction):
     if interaction.guild_id is None or interaction.guild_id not in TRACKERS:
         await interaction.response.send_message("No active tracker here. Use /tracker start.", ephemeral=True)
         return
     state = TRACKERS[interaction.guild_id]
     async with state.lock:
-        # Update the pinned/live tracker message first (so the buttons/summary stay current)
         await update_tracker_message(interaction.client, state)
-        # Build a comprehensive snapshot
-        embeds = make_full_snapshot_embeds(state)
+    await interaction.response.send_message("Tracker refreshed.", ephemeral=True)
 
-    # Post the snapshot publicly in-channel (non-ephemeral)
-    await interaction.response.send_message(embeds=embeds)
+# Restore state on startup for all guilds
+@bot.event
+async def on_ready():
+    for g in bot.guilds:
+        try:
+            await load_state_from_channel(bot, g)
+        except Exception:
+            pass
 
 # Register the group
 bot.tree.add_command(tracker_group)
