@@ -145,7 +145,7 @@ def make_full_snapshot_embeds(state: TrackerState) -> List[discord.Embed]:
     """Build a full, public snapshot: stats + played & remaining lists for both players."""
     # Main summary
     e_main = discord.Embed(
-        title="🎯 2-Player Siege Tracker — Full Snapshot",
+        title="✨ 2-Player Siege Tracker — Full Snapshot",
         color=discord.Color.blurple()
     )
     e_main.description = (
@@ -368,7 +368,7 @@ async def tracker_start(interaction: discord.Interaction, player1: str, player2:
     TRACKERS[interaction.guild_id] = state
 
     # Send initial message with view
-    embed = discord.Embed(title="🎯 2-Player Siege Tracker", color=discord.Color.blurple())
+    embed = discord.Embed(title="✨ 2-Player Siege Tracker", color=discord.Color.blurple())
     embed.description = (
         "Use **/tracker play** to mark an operator as played.\n"
         "Use the **View Remaining** buttons or `/tracker remaining` to see operators left.\n"
